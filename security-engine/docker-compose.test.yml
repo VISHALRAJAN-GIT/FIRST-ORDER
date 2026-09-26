@@ -1,0 +1,59 @@
+# Test infrastructure for the TIXIFY-VR security engine.
+#
+# Concurrency guarantees in this project are only meaningful against real Redis
+# and real Postgres. An in-memory double cannot demonstrate that two concurrent
+# ticket scans produce exactly one success, because the double is itself a
+# single-threaded process. So the test suite runs against these containers.
+#
+#   npm run infra:up      start
+#   npm run infra:wait    block until both are accepting connections
+#   npm run infra:down    stop and delete volumes
+#
+# Not for production. Use a managed Redis (Upstash / Redis Cloud) and a pooled
+# Postgres connection string when deploying to Vercel.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: tixify-sec-redis
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 2s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tixify-sec-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: tixify
+      # Deterministic collation so index behaviour matches CI.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - sec-pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tixify"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+volumes:
+  sec-pgdata:
+    name: tixify-sec-pgdata

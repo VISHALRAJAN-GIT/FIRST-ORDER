@@ -32,6 +32,9 @@ import { SecurityError } from '../core/errors';
 import type { Clock } from '../core/clock';
 import { KeyRing, toPrivateKeyObject } from './key-store';
 
+/** Ed25519 signatures are always 64 bytes. No other length is valid. */
+const ED25519_SIGNATURE_BYTES = 64;
+
 /** Reason a signature check failed. Internal only — never returned to clients. */
 export type SignatureFailureReason =
   | 'MALFORMED_ENVELOPE'
@@ -138,9 +141,10 @@ export class TicketSigner {
     } catch {
       return { valid: false, reason: 'MALFORMED_ENVELOPE' };
     }
-    // A base64 string can decode to almost nothing; reject implausible lengths
-    // before invoking the verifier.
-    if (signature.length === 0 || signature.length > 128) {
+    // An Ed25519 signature is always exactly 64 bytes. Enforcing that up front
+    // rejects truncated, padded, or algorithm-confused input before the verifier
+    // is invoked, and keeps every bad-signature path on one uniform answer.
+    if (signature.length !== ED25519_SIGNATURE_BYTES) {
       return { valid: false, reason: 'MALFORMED_ENVELOPE' };
     }
 
