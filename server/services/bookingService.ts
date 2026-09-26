@@ -47,16 +47,43 @@ export async function createReservation(
 
   return db.transaction(async (tx) => {
     if (input.idempotencyKey) {
-      const existing = await tx
-        .select()
-        .from(idempotencyKeys)
-        .where(and(eq(idempotencyKeys.key, input.idempotencyKey), eq(idempotencyKeys.userId, input.userId), eq(idempotencyKeys.operation, "reservation.create")))
-        .limit(1);
-      if (existing[0]) {
-        if (existing[0].requestHash !== hash) throw new BookingError("IDEMPOTENCY_CONFLICT", "This idempotency key was already used for a different request.");
-        if (existing[0].responseJson) return JSON.parse(existing[0].responseJson);
-      } else {
-        await tx.insert(idempotencyKeys).values({ key: input.idempotencyKey, userId: input.userId, operation: "reservation.create", requestHash: hash });
+      // Claim the key with ON CONFLICT DO NOTHING + RETURNING rather than
+      // SELECT-then-INSERT.
+      //
+      // A client that retries a request it believes timed out sends the same
+      // key again, and those retries are concurrent by nature. With a plain
+      // SELECT followed by an INSERT, both transactions read "no such row", both
+      // try to insert, and the loser aborts on
+      // idempotency_key_operation_idx with a raw 23505 that surfaces as a 500.
+      //
+      // ON CONFLICT DO NOTHING blocks until the other transaction commits and
+      // then returns no row, so RETURNING is what distinguishes the two cases:
+      // a row means this transaction won the claim and must run the body, and no
+      // row means someone else already owns the key and this must replay their
+      // answer instead.
+      const claimed = await tx
+        .insert(idempotencyKeys)
+        .values({ key: input.idempotencyKey, userId: input.userId, operation: "reservation.create", requestHash: hash })
+        .onConflictDoNothing()
+        .returning({ key: idempotencyKeys.key });
+
+      if (claimed.length === 0) {
+        const existing = await tx
+          .select()
+          .from(idempotencyKeys)
+          .where(and(eq(idempotencyKeys.key, input.idempotencyKey), eq(idempotencyKeys.userId, input.userId), eq(idempotencyKeys.operation, "reservation.create")))
+          .limit(1);
+        const stored = existing[0];
+        if (stored?.requestHash !== hash) {
+          throw new BookingError("IDEMPOTENCY_CONFLICT", "This idempotency key was already used for a different request.");
+        }
+        // Null only if the winning transaction failed before storing a
+        // response, in which case its work was rolled back and this caller may
+        // safely take the key over.
+        if (!stored?.responseJson) {
+          throw new BookingError("IDEMPOTENCY_IN_PROGRESS", "An identical request is still being processed. Retry shortly.");
+        }
+        return JSON.parse(stored.responseJson);
       }
     }
 
