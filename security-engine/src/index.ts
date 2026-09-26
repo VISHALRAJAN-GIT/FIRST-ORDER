@@ -164,6 +164,20 @@ export type {
   BotProtectionOptions,
 } from './bot-protection/bot-protection';
 
+/* ---------------------------------------------------------------- Part 13 */
+
+export { SecurityApi, SECURITY_ROUTE_IDS, listSecurityRoutes } from './api/security-api';
+export type {
+  SecurityApiOptions,
+  SecurityRouteId,
+  TicketVerificationPort,
+  TicketScanPort,
+  QueuePort,
+} from './api/security-api';
+export type { SecurityHttpRequest, SecurityHttpResponse, HttpHeaders } from './api/http-types';
+export { securityMiddleware, toHttpRequest } from './api/express-adapter';
+export type { ExpressLikeRequest, ExpressLikeResponse, ExpressAdapterOptions } from './api/express-adapter';
+
 export { DEFAULT_SEVERITIES } from './bot-protection/bot-signal-types';
 
 export { ChallengeStore } from './bot-protection/challenge';

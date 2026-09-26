@@ -49,6 +49,9 @@ describe('package public surface', () => {
       'RateLimiter', 'ENDPOINT_POLICIES', 'rateLimitedResponse',
       // bot protection
       'BotProtection', 'DEFAULT_BOT_CONFIG', 'ChallengeStore',
+      // part 13: framework-neutral API
+      'SecurityApi', 'SECURITY_ROUTE_IDS', 'listSecurityRoutes',
+      'securityMiddleware', 'toHttpRequest',
       // queue
       'VirtualQueue', 'PostgresQueueStore', 'AdmissionTokenCodec',
       // validation
