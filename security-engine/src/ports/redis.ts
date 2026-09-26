@@ -159,6 +159,84 @@ export interface IoredisLike {
   quit(): Promise<void>;
 }
 
+/**
+ * Compare-and-set, server-side.
+ *
+ * KEYS[1] = key
+ * ARGV[1] = expected current value
+ * ARGV[2] = new value
+ * ARGV[3] = TTL in seconds, or 0 for no expiry
+ *
+ * A `GET` followed by a `SET` is NOT this. It is two round trips with an
+ * arbitrary window in between, during which a second client can write the key —
+ * and then the first client overwrites it, having "succeeded" at a comparison
+ * that was already stale. That is a lost update, and it is exactly the bug that
+ * lets two workers both believe they won a PROCESSING -> SUCCESS transition.
+ *
+ * Running the compare and the write inside one script means Redis executes them
+ * as an indivisible unit: no other client can interleave between the read and the
+ * write, because the server never yields mid-script.
+ */
+const COMPARE_AND_SET_SCRIPT = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  if tonumber(ARGV[3]) > 0 then
+    redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  else
+    redis.call('SET', KEYS[1], ARGV[2])
+  end
+  return 1
+end
+return 0
+`;
+
+/**
+ * Increment with TTL applied on creation only.
+ *
+ * ARGV[1] = increment, ARGV[2] = TTL seconds
+ *
+ * The `value == increment` test is how a single atomic script decides whether it
+ * just created the key, and therefore whether the TTL needs setting. Done as
+ * `INCRBY` then `EXPIRE` from the client, a crash in between leaves a
+ * permanently un-expiring counter.
+ */
+const INCREMENT_SCRIPT = `
+local value = redis.call('INCRBY', KEYS[1], ARGV[1])
+if value == tonumber(ARGV[1]) then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return value
+`;
+
+/**
+ * Add members to a set and refresh the window in one step.
+ *
+ * ARGV[1] = window seconds, ARGV[2..] = members
+ */
+const ADD_TO_SET_SCRIPT = `
+local added = 0
+for i = 2, #ARGV do
+  added = added + redis.call('SADD', KEYS[1], ARGV[i])
+end
+if added > 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return added
+`;
+
+/**
+ * Increment a hash field, applying the TTL only when the hash is created.
+ *
+ * ARGV[1] = field, ARGV[2] = increment, ARGV[3] = TTL seconds
+ */
+const INCREMENT_HASH_FIELD_SCRIPT = `
+local existed = redis.call('EXISTS', KEYS[1])
+local value = redis.call('HINCRBY', KEYS[1], ARGV[1], ARGV[2])
+if existed == 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[3])
+end
+return value
+`;
+
 /** Adapt ioredis to the narrower `RedisLike` surface. */
 export function wrapIoredis(client: IoredisLike): RedisLike {
   return {
@@ -177,16 +255,15 @@ export function wrapIoredis(client: IoredisLike): RedisLike {
       return result === 'OK' || result === 1;
     },
     async compareAndSet(key, expected, next, ttlSeconds) {
-      // WATCH/MULTI/EXEC. Only reached on state transitions, which are rare
-      // compared to rate-limit reads, so the extra round trip is acceptable.
-      const current = await client.get(key);
-      if (current !== String(expected)) return false;
-      if (ttlSeconds !== undefined) {
-        await client.set(key, next, 'EX', ttlSeconds);
-      } else {
-        await client.set(key, next);
-      }
-      return true;
+      const result = await client.eval(
+        COMPARE_AND_SET_SCRIPT,
+        1,
+        key,
+        String(expected),
+        String(next),
+        ttlSeconds !== undefined ? Math.floor(ttlSeconds) : 0,
+      );
+      return Number(result) === 1;
     },
     async delete(key) {
       return (await client.del(key)) > 0;
@@ -198,16 +275,25 @@ export function wrapIoredis(client: IoredisLike): RedisLike {
       return client.ttl(key);
     },
     async increment(key, ttlSeconds, initialValue = 1) {
-      const value = await client.incrby(key, initialValue);
-      if (value === initialValue) {
-        await client.expire(key, ttlSeconds);
-      }
-      return value;
+      const value = await client.eval(
+        INCREMENT_SCRIPT,
+        1,
+        key,
+        Math.floor(initialValue),
+        Math.floor(ttlSeconds),
+      );
+      return Number(value);
     },
     async addToSet(key, members, windowSeconds) {
-      const added = await client.sadd(key, ...members.map(String));
-      if (added > 0) await client.expire(key, windowSeconds);
-      return added;
+      if (members.length === 0) return 0;
+      const result = await client.eval(
+        ADD_TO_SET_SCRIPT,
+        1,
+        key,
+        Math.floor(windowSeconds),
+        ...members.map(String),
+      );
+      return Number(result);
     },
     async setCardinality(key) {
       return client.scard(key);
@@ -220,10 +306,15 @@ export function wrapIoredis(client: IoredisLike): RedisLike {
       return client.srem(key, ...members.map(String));
     },
     async incrementHashField(key, field, ttlSeconds, initialValue = 1) {
-      const existed = await client.exists(key);
-      const value = await client.hincrby(key, field, initialValue);
-      if (!existed) await client.expire(key, ttlSeconds);
-      return value;
+      const value = await client.eval(
+        INCREMENT_HASH_FIELD_SCRIPT,
+        1,
+        key,
+        field,
+        Math.floor(initialValue),
+        Math.floor(ttlSeconds),
+      );
+      return Number(value);
     },
     async hashGetAll(key) {
       return client.hgetall(key);
