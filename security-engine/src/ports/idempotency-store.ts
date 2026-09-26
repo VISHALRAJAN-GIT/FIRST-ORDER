@@ -31,7 +31,7 @@
  * store alone is sufficient.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { RedisLike } from './redis';
 
 export const IDEMPOTENCY_STATES = ['PROCESSING', 'SUCCESS', 'FAILED'] as const;
@@ -57,7 +57,20 @@ export interface IdempotencyRecord {
 }
 
 export type ClaimResult =
-  | { readonly claimed: true }
+  | {
+      readonly claimed: true;
+      /**
+       * Fencing token identifying THIS claim. It must be passed back to
+       * `complete`.
+       *
+       * The claim has a TTL, so a slow owner can outlive it and be replaced by a
+       * retry. Without a token the replaced owner cannot tell it has been
+       * replaced, and it will cheerfully record a result against a claim it no
+       * longer holds — marking a still-running retry complete. The token makes
+       * that detectable in one comparison.
+       */
+      readonly claimId: string;
+    }
   /**
    * Someone else owns this key right now. The caller must NOT execute the
    * operation; it should return 409 or poll until the record completes.
@@ -87,6 +100,10 @@ export interface IdempotencyStore {
   /**
    * Attach the result to a claimed key and move it to a terminal state.
    *
+   * MUST be a no-op when `claimId` is not the current holder's token. A caller
+   * that overran its claim TTL has been replaced, and its result describes work
+   * that the current holder is still doing.
+   *
    * `FAILED` is stored rather than deleted on purpose: a failed payment must not
    * be retried under the same key, because the failure may have occurred after
    * the provider charged the card. Callers that genuinely want a fresh attempt
@@ -96,6 +113,7 @@ export interface IdempotencyStore {
     readonly key: string;
     readonly endpoint: string;
     readonly requestHash: string;
+    readonly claimId: string;
     readonly state: 'SUCCESS' | 'FAILED';
     readonly response: IdempotentResponse;
   }): Promise<void>;
@@ -154,9 +172,17 @@ function sha256Hex(value: string): string {
 /**
  * Redis-backed store: exclusive claim via SET NX, durable result in Postgres.
  *
- * See `IdempotencyStore` for why both halves exist. The `complete` path uses
- * compare-and-set so a late writer cannot overwrite a result another worker
- * already stored.
+ * See `IdempotencyStore` for why both halves exist.
+ *
+ * Two rules that are easy to get wrong and are load-bearing here:
+ *
+ *  1. Winning the Redis claim is not permission to execute. The durable record is
+ *     consulted first, because the coordination key has a TTL and the completed
+ *     operation outlives it. Skipping that check reintroduces the duplicate charge
+ *     the whole feature exists to prevent, just with a longer fuse.
+ *  2. `complete` is a compare-and-set, not an overwrite. An owner that overran its
+ *     TTL may be racing a retry that has already re-claimed the same key, and a
+ *     blind write would mark that still-running execution complete.
  */
 export interface RedisIdempotencyStoreOptions {
   readonly redis: RedisLike;
@@ -173,7 +199,9 @@ interface ClaimEnvelope {
   readonly state: IdempotencyState;
   readonly requestHash: string;
   readonly endpoint: string;
+  readonly claimId: string;
   readonly response?: IdempotentResponse;
+  readonly createdAt: string;
   readonly completedAt?: string;
 }
 
@@ -203,15 +231,44 @@ export class RedisIdempotencyStore implements IdempotencyStore {
     readonly ttlSeconds: number;
   }): Promise<ClaimResult> {
     const redisKey = this.#key(input.key, input.endpoint);
+    const now = this.#nowIso();
+    const claimId = randomUUID();
     const envelope: ClaimEnvelope = {
       state: 'PROCESSING',
       requestHash: input.requestHash,
       endpoint: input.endpoint,
+      claimId,
+      createdAt: now,
     };
 
     const claimed = await this.#redis.setIfAbsent(redisKey, JSON.stringify(envelope), input.ttlSeconds);
     if (claimed) {
-      return { claimed: true };
+      // Winning the Redis claim is NOT sufficient. If the coordination key has
+      // already expired but the durable record has not, the operation finished
+      // successfully some time ago and re-executing it would duplicate a real
+      // booking and charge a card twice. The whole point of the durable mirror —
+      // stated in this port's own documentation — is that a duplicate arriving
+      // after the Redis window replays instead of re-running, so the mirror has
+      // to be consulted before we are allowed to execute.
+      if (this.#durable) {
+        const prior = await this.#durable.get(input.key, input.endpoint);
+        if (prior) {
+          // Roll our speculative claim back: the durable record is the truth, and
+          // leaving a PROCESSING envelope on top of it would shadow the result we
+          // are about to replay.
+          await this.#redis.delete(redisKey);
+          if (prior.requestHash !== input.requestHash) {
+            return { claimed: false, inFlight: false, conflict: true };
+          }
+          return {
+            claimed: false,
+            inFlight: false,
+            conflict: false,
+            record: prior,
+          };
+        }
+      }
+      return { claimed: true, claimId };
     }
 
     // Key exists. Either a concurrent worker owns it, or a completed result is
@@ -247,7 +304,7 @@ export class RedisIdempotencyStore implements IdempotencyStore {
         state: existing.state,
         requestHash: existing.requestHash,
         response: existing.response,
-        createdAt: this.#nowIso(),
+        createdAt: existing.createdAt,
         completedAt: existing.completedAt,
       },
     };
@@ -257,6 +314,7 @@ export class RedisIdempotencyStore implements IdempotencyStore {
     readonly key: string;
     readonly endpoint: string;
     readonly requestHash: string;
+    readonly claimId: string;
     readonly state: 'SUCCESS' | 'FAILED';
     readonly response: IdempotentResponse;
   }): Promise<void> {
@@ -264,14 +322,25 @@ export class RedisIdempotencyStore implements IdempotencyStore {
     const raw = await this.#redis.get(redisKey);
     if (raw === null) return;
 
-    const existing = JSON.parse(raw) as ClaimEnvelope;
+    let existing: ClaimEnvelope;
+    try {
+      existing = JSON.parse(raw) as ClaimEnvelope;
+    } catch {
+      return;
+    }
     if (existing.requestHash !== input.requestHash) return;
+    // Fencing check. A re-read alone cannot detect a replaced claim, because the
+    // replacement looks exactly like our own envelope apart from the token — so
+    // the comparison has to be against the token we were handed, not against
+    // whatever happens to be in Redis now.
+    if (existing.claimId !== input.claimId) return;
 
+    const completedAt = this.#nowIso();
     const envelope: ClaimEnvelope = {
       ...existing,
       state: input.state,
       response: input.response,
-      completedAt: this.#nowIso(),
+      completedAt,
     };
 
     if (this.#durable) {
@@ -281,16 +350,20 @@ export class RedisIdempotencyStore implements IdempotencyStore {
         state: input.state,
         requestHash: input.requestHash,
         response: input.response,
-        createdAt: existing.completedAt ?? this.#nowIso(),
-        completedAt: envelope.completedAt,
+        createdAt: existing.createdAt,
+        completedAt,
       });
     }
 
-    // Overwrite unconditionally: the claim is already exclusively ours, so no
-    // other writer can legitimately hold this key. Preserving the original TTL
-    // is deliberate — the record should expire ttlSeconds after the *claim*, not
-    // be kept alive indefinitely by a stream of retries.
-    await this.#redis.set(redisKey, JSON.stringify(envelope), Math.max(1, await this.#redis.ttl(redisKey)));
+    // Compare-and-set against the exact bytes we read. An unconditional write
+    // looks safe because the claim is exclusive, but it is not: if this owner
+    // overran its TTL, a retry may already have re-claimed the same key with the
+    // same request hash. A blind overwrite would then mark a still-running
+    // second execution complete, and a duplicate arriving in that window would be
+    // handed a result for work that had not finished. CAS loses the race
+    // gracefully instead — the durable record above is already correct.
+    const ttl = Math.max(1, await this.#redis.ttl(redisKey));
+    await this.#redis.compareAndSet(redisKey, raw, JSON.stringify(envelope), ttl);
   }
 
   async get(key: string, endpoint: string): Promise<IdempotencyRecord | null> {
@@ -303,7 +376,7 @@ export class RedisIdempotencyStore implements IdempotencyStore {
         state: envelope.state,
         requestHash: envelope.requestHash,
         response: envelope.response,
-        createdAt: this.#nowIso(),
+        createdAt: envelope.createdAt,
         completedAt: envelope.completedAt,
       };
     }

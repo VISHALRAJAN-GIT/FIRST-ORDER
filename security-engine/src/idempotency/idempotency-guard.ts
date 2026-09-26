@@ -149,7 +149,7 @@ export class IdempotencyGuard {
         body: error instanceof SecurityError ? error.toPublicJSON() : { success: false, error: { code: 'INTERNAL_ERROR', message: 'Something went wrong. Please try again.' } },
       };
       await this.#store
-        .complete({ key: idempotencyKey, endpoint: path, requestHash, state: 'FAILED', response: failure })
+        .complete({ key: idempotencyKey, endpoint: path, requestHash, claimId: claim.claimId, state: 'FAILED', response: failure })
         .catch(() => {
           // Best effort. A lost FAILED record means a retry re-executes, which is
           // the lesser evil compared to failing the original request after the
@@ -162,6 +162,7 @@ export class IdempotencyGuard {
       key: idempotencyKey,
       endpoint: path,
       requestHash,
+      claimId: claim.claimId,
       state: 'SUCCESS',
       response,
     });
