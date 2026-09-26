@@ -18,7 +18,7 @@
  *
  * For the same reason the envelope carries no price, no payment status, no
  * credentials, and no internal identifiers. The gate needs to know a ticket is
- * genuine and unredeemed — nothing more.
+ * genuine and unredeemed â€” nothing more.
  *
  * ## Why the envelope is nested
  *
@@ -48,8 +48,22 @@ const identifier = z
  * The signed claim. Every field is bounded and pattern-constrained so a hostile
  * payload cannot inflate the canonical string or smuggle control characters into
  * logs and dashboards.
+ *
+ * ## .strict() is a security control, not a style preference
+ *
+ * Zod's default object behaviour is to SILENTLY DROP unknown keys. Under that
+ * default, a QR payload with an injected "role":"ADMIN" field would be stripped
+ * back to the legitimate claim, the signature would verify, and the ticket would
+ * be admitted — with the smuggled field silently discarded. The admission would
+ * be correct only as long as every downstream consumer used the *validated*
+ * object rather than the raw parsed one, which is a property nothing enforces.
+ *
+ * Strict mode rejects the payload instead. An attacker who edits a signed claim
+ * gets a hard rejection, and a legitimate issuer can never accidentally produce
+ * a claim with a field this version does not understand. Failing closed on
+ * unrecognised structure is the whole point of a signature.
  */
-export const ticketPayloadSchema = z.object({
+export const ticketPayloadSchema = z.strictObject({
   ticketId: identifier,
   eventId: identifier,
   seatId: identifier,
@@ -64,7 +78,7 @@ export const ticketPayloadSchema = z.object({
 export type TicketPayload = z.infer<typeof ticketPayloadSchema>;
 
 /** The outer, signed-over structure that becomes the QR string. */
-export const ticketEnvelopeSchema = z.object({
+export const ticketEnvelopeSchema = z.strictObject({
   v: z.literal(TICKET_ENVELOPE_VERSION),
   /** JSON string of the canonical signed payload. */
   ticket: z.string().min(1).max(4096),

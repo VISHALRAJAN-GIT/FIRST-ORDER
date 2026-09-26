@@ -74,6 +74,17 @@ export class InMemoryTicketRepository implements TicketRepository {
     this.#tickets.set(ticketId, { ...ticket, state });
   }
 
+  /**
+   * Test helper: move a ticket to a different seat, simulating a reissue that
+   * reassigns the holder while leaving the old QR's signature cryptographically
+   * valid. Used to prove the claim/record mismatch is reported distinctly.
+   */
+  setSeatId(ticketId: string, seatId: string): void {
+    const ticket = this.#tickets.get(ticketId);
+    if (!ticket) throw new Error(`Unknown ticket: ${ticketId}`);
+    this.#tickets.set(ticketId, { ...ticket, seatId });
+  }
+
   get(ticketId: string): TicketRecord | undefined {
     return this.#tickets.get(ticketId);
   }
