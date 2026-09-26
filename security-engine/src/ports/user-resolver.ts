@@ -59,6 +59,18 @@ export const CLIENT_CONTROLLED_FIELDS = [
 
 export type ClientControlledField = (typeof CLIENT_CONTROLLED_FIELDS)[number];
 
+/*
+ * NOTE: there is deliberately no strip helper in this file.
+ *
+ * An earlier draft had a top-level-only, case-sensitive `delete` loop here. It was
+ * removed rather than kept alongside the real implementation in
+ * `src/validation/request-sanitizer.ts`, because two functions that both claim to
+ * enforce "never trust the client" is one too many: the shallow one misses
+ * `payment: { amount }`, so a caller who picks the wrong import gets a weaker
+ * guarantee with no signal that they did. Single source of truth instead.
+ */
+
+
 /**
  * Resolve the caller from a verified credential.
  *
@@ -109,20 +121,3 @@ export class ConfiguredAdminAuthorizer implements AdminAuthorizer {
   }
 }
 
-/** Strip every client-controlled authority field from an object, in place. */
-export function stripClientControlledFields<T extends Record<string, unknown>>(
-  input: T,
-  extraFields: readonly string[] = [],
-): { sanitized: T; stripped: string[] } {
-  const blocked = new Set<string>([...CLIENT_CONTROLLED_FIELDS, ...extraFields]);
-  const stripped: string[] = [];
-
-  for (const key of Object.keys(input)) {
-    if (blocked.has(key)) {
-      delete input[key];
-      stripped.push(key);
-    }
-  }
-
-  return { sanitized: input, stripped };
-}
