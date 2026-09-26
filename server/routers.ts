@@ -88,8 +88,8 @@ export const appRouter = router({
     }).refine((input) => input.endTime > input.startTime, { message: "End time must be after start time.", path: ["endTime"] })).mutation(async ({ ctx, input }) => {
       const db = await dbOrThrow();
       return db.transaction(async (tx) => {
-        const venueResult = await tx.insert(venues).values({ name: input.venueName, address: input.venueAddress, capacity: input.ticketSlots });
-        const venueId = Number(venueResult[0].insertId);
+        const venueResult = await tx.insert(venues).values({ name: input.venueName, address: input.venueAddress, capacity: input.ticketSlots }).returning({ id: venues.id });
+        const venueId = venueResult[0].id;
         const eventResult = await tx.insert(events).values({
           venueId,
           organizerId: ctx.user.id,
@@ -101,8 +101,8 @@ export const appRouter = router({
           endTime: input.endTime,
           status: input.publish ? "PUBLISHED" : "DRAFT",
           maxTicketsPerUser: input.maxTicketsPerUser,
-        });
-        const eventId = Number(eventResult[0].insertId);
+        }).returning({ id: events.id });
+        const eventId = eventResult[0].id;
         await tx.insert(ticketTypes).values({ eventId, name: "STANDARD", price: input.ticketPrice.toFixed(2), quantity: input.ticketSlots, maxPerUser: input.maxTicketsPerUser });
         const seatRows = Array.from({ length: input.ticketSlots }, (_, index) => ({ venueId, section: "MAIN", row: "A", number: index + 1, seatType: "STANDARD" as const }));
         await tx.insert(seats).values(seatRows);
@@ -175,13 +175,13 @@ export const appRouter = router({
     events: adminProcedure.query(() => listPublishedEvents()),
     createVenue: adminProcedure.input(z.object({ name: z.string().min(2).max(160), address: z.string().min(2).max(255), capacity: z.number().int().positive() })).mutation(async ({ input }) => {
       const db = await dbOrThrow();
-      const result = await db.insert(venues).values(input);
-      return { id: Number(result[0].insertId) };
+      const result = await db.insert(venues).values(input).returning({ id: venues.id });
+      return { id: result[0].id };
     }),
     createEvent: adminProcedure.input(z.object({ venueId: idSchema, name: z.string().min(2).max(180), slug: z.string().min(2).max(180), description: z.string().min(10), startTime: z.coerce.date(), endTime: z.coerce.date(), maxTicketsPerUser: z.number().int().min(1).max(20), ticketTypes: z.array(z.object({ name: z.string().min(2), price: z.number().nonnegative(), quantity: z.number().int().positive(), maxPerUser: z.number().int().positive() })).min(1) })).mutation(async ({ input }) => {
       const db = await dbOrThrow();
-      const result = await db.insert(events).values({ venueId: input.venueId, name: input.name, slug: input.slug, description: input.description, startTime: input.startTime, endTime: input.endTime, maxTicketsPerUser: input.maxTicketsPerUser, status: "DRAFT" });
-      const eventId = Number(result[0].insertId);
+      const result = await db.insert(events).values({ venueId: input.venueId, name: input.name, slug: input.slug, description: input.description, startTime: input.startTime, endTime: input.endTime, maxTicketsPerUser: input.maxTicketsPerUser, status: "DRAFT" }).returning({ id: events.id });
+      const eventId = result[0].id;
       await db.insert(ticketTypes).values(input.ticketTypes.map((type) => ({ ...type, eventId, price: type.price.toFixed(2) })));
       return { id: eventId, status: "DRAFT" as const };
     }),
@@ -197,8 +197,8 @@ export const appRouter = router({
     }),
     createSeats: adminProcedure.input(z.object({ eventId: idSchema, venueId: idSchema, seats: z.array(z.object({ section: z.string().min(1).max(32), row: z.string().min(1).max(32), number: z.number().int().positive(), seatType: z.enum(["VIP", "PREMIUM", "STANDARD"]) })).min(1) })).mutation(async ({ input }) => {
       const db = await dbOrThrow();
-      const seatRows = await db.insert(seats).values(input.seats.map((seat) => ({ ...seat, venueId: input.venueId })));
-      const firstId = Number(seatRows[0].insertId);
+      const seatRows = await db.insert(seats).values(input.seats.map((seat) => ({ ...seat, venueId: input.venueId }))).returning({ id: seats.id });
+      const firstId = seatRows[0].id;
       const createdSeats = await db.select().from(seats).where(and(eq(seats.venueId, input.venueId), inArray(seats.number, input.seats.map((seat) => seat.number))));
       await db.insert(inventory).values(createdSeats.map((seat) => ({ eventId: input.eventId, seatId: seat.id, status: "AVAILABLE" as const })));
       return { firstId, count: createdSeats.length };

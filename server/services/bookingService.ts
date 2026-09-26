@@ -96,8 +96,8 @@ export async function createReservation(
     const fallbackPrice = prices[0]?.price ?? "0.00";
     const expiresAt = reservationExpiry();
     const totalAmount = sumMoney(distinctSeatIds.map(() => fallbackPrice));
-    const reservationResult = await tx.insert(reservations).values({ userId: input.userId, eventId: input.eventId, status: "RESERVED", expiresAt, totalAmount: totalAmount.toFixed(2) });
-    const reservationId = Number(reservationResult[0].insertId);
+    const reservationResult = await tx.insert(reservations).values({ userId: input.userId, eventId: input.eventId, status: "RESERVED", expiresAt, totalAmount: totalAmount.toFixed(2) }).returning({ id: reservations.id });
+    const reservationId = reservationResult[0].id;
 
     for (const { inventory: item } of lockedInventory) {
       await tx.update(inventory).set({ status: "RESERVED", reservationId, updatedAt: new Date() }).where(eq(inventory.id, item.id));
@@ -161,8 +161,8 @@ export async function createBooking(db: Database, input: { userId: number; reser
 
     const existing = await tx.select().from(bookings).where(eq(bookings.reservationId, reservation.id)).limit(1);
     if (existing[0]) return { bookingId: existing[0].id, status: existing[0].status };
-    const bookingResult = await tx.insert(bookings).values({ userId: input.userId, eventId: reservation.eventId, reservationId: reservation.id, status: "PENDING", totalAmount: reservation.totalAmount });
-    const bookingId = Number(bookingResult[0].insertId);
+    const bookingResult = await tx.insert(bookings).values({ userId: input.userId, eventId: reservation.eventId, reservationId: reservation.id, status: "PENDING", totalAmount: reservation.totalAmount }).returning({ id: bookings.id });
+    const bookingId = bookingResult[0].id;
     const items = await tx.select().from(reservationItems).where(eq(reservationItems.reservationId, reservation.id));
     const seatIds: number[] = [];
     for (const item of items) {

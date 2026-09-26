@@ -1,5 +1,6 @@
 import { and, asc, desc, eq, inArray, lt, sql } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/mysql2";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
 import {
   bookings,
   events,
@@ -20,7 +21,7 @@ let _db: ReturnType<typeof drizzle> | null = null;
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
-      _db = drizzle(process.env.DATABASE_URL);
+      _db = drizzle(new Pool({ connectionString: process.env.DATABASE_URL }));
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
       _db = null;
@@ -58,7 +59,10 @@ export async function upsertUser(user: InsertUser): Promise<void> {
     updateSet.role = "admin";
   }
 
-  await db.insert(users).values(values).onDuplicateKeyUpdate({ set: updateSet });
+  await db
+    .insert(users)
+    .values(values)
+    .onConflictDoUpdate({ target: users.openId, set: updateSet });
 }
 
 export async function getUserByOpenId(openId: string) {
@@ -86,7 +90,9 @@ export async function listPublishedEvents() {
       venueName: venues.name,
       venueAddress: venues.address,
       capacity: venues.capacity,
-      availableSeats: sql<number>`(SELECT COUNT(*) FROM inventory AS availableInventory WHERE availableInventory.eventId = events.id AND availableInventory.status = 'AVAILABLE')`,
+      // Postgres returns COUNT(*) as bigint, which node-postgres hands back as a
+      // string. Cast to int so the client receives a number, as it did on MySQL.
+      availableSeats: sql<number>`(SELECT COUNT(*)::int FROM inventory AS availableInventory WHERE availableInventory.eventId = events.id AND availableInventory.status = 'AVAILABLE')`,
     })
     .from(events)
     .innerJoin(venues, eq(events.venueId, venues.id))
