@@ -1,0 +1,54 @@
+{
+  "name": "@tixify/security-engine",
+  "version": "0.1.0",
+  "description": "Person 2 — Security & protection layer for the TIXIFY-VR high-demand ticket booking platform. Cryptographic tickets, QR validation, replay protection, idempotency, distributed rate limiting, bot protection, virtual queue, security events and audit.",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "migrations",
+    ".env.example"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:security": "vitest run tests/security",
+    "test:concurrency": "vitest run tests/concurrency",
+    "test:load": "vitest run --config vitest.load.config.ts",
+    "test:coverage": "vitest run --coverage",
+    "infra:up": "docker compose -f docker-compose.test.yml up -d",
+    "infra:down": "docker compose -f docker-compose.test.yml down -v",
+    "infra:wait": "node scripts/wait-for-infra.mjs",
+    "migrate": "node scripts/migrate.mjs",
+    "keys:generate": "node scripts/generate-keys.mjs"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1",
+    "pg": "^8.13.1",
+    "qrcode": "^1.5.4",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "@types/qrcode": "^1.5.5",
+    "@vitest/coverage-v8": "^2.1.8",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
