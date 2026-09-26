@@ -28,7 +28,7 @@
     "test:watch": "vitest",
     "test:security": "vitest run tests/security",
     "test:concurrency": "vitest run tests/concurrency",
-    "test:load": "vitest run tests/load",
+    "test:load": "vitest run --config vitest.load.config.ts",
     "test:coverage": "vitest run --coverage",
     "infra:up": "docker compose -f docker-compose.test.yml up -d",
     "infra:down": "docker compose -f docker-compose.test.yml down -v",
