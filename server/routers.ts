@@ -113,8 +113,8 @@ export const appRouter = router({
     }),
     publishEvent: organizerProcedure.input(z.object({ eventId: idSchema })).mutation(async ({ ctx, input }) => {
       const db = await dbOrThrow();
-      const result = await db.update(events).set({ status: "PUBLISHED", updatedAt: new Date() }).where(and(eq(events.id, input.eventId), eq(events.organizerId, ctx.user.id)));
-      if (!result[0].affectedRows) throw new TRPCError({ code: "NOT_FOUND", message: "Organizer event not found." });
+      const updated = await db.update(events).set({ status: "PUBLISHED", updatedAt: new Date() }).where(and(eq(events.id, input.eventId), eq(events.organizerId, ctx.user.id))).returning({ id: events.id });
+      if (updated.length === 0) throw new TRPCError({ code: "NOT_FOUND", message: "Organizer event not found." });
       return { success: true as const };
     }),
   }),

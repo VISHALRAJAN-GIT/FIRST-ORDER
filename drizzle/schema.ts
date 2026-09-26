@@ -11,13 +11,22 @@ import {
   varchar,
 } from "drizzle-orm/pg-core";
 
+export const userRole = pgEnum("user_role", ["user", "admin"]);
+export const eventStatus = pgEnum("event_status", ["DRAFT", "PUBLISHED", "SOLD_OUT", "CANCELLED", "COMPLETED"]);
+export const seatType = pgEnum("seat_type", ["VIP", "PREMIUM", "STANDARD"]);
+export const inventoryStatus = pgEnum("inventory_status", ["AVAILABLE", "RESERVED", "SOLD", "CANCELLED"]);
+export const reservationStatus = pgEnum("reservation_status", ["RESERVED", "PAYMENT_PENDING", "CONFIRMED", "EXPIRED", "PAYMENT_FAILED", "CANCELLED"]);
+export const bookingStatus = pgEnum("booking_status", ["PENDING", "CONFIRMED", "CANCELLED"]);
+export const paymentStatus = pgEnum("payment_status", ["PENDING", "SUCCEEDED", "FAILED", "REFUNDED"]);
+export const ticketStatus = pgEnum("ticket_status", ["VALID", "CANCELLED"]);
+
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
   openId: varchar("openId", { length: 64 }).notNull().unique(),
   name: text("name"),
   email: varchar("email", { length: 320 }),
   loginMethod: varchar("loginMethod", { length: 64 }),
-  role: pgEnum("user_role", ["user", "admin"]).default("user").notNull(),
+  role: userRole("role").default("user").notNull(),
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updatedAt", { withTimezone: true })
     .defaultNow()
@@ -50,7 +59,7 @@ export const events = pgTable("events", {
   description: text("description").notNull(),
   startTime: timestamp("startTime", { withTimezone: true }).notNull(),
   endTime: timestamp("endTime", { withTimezone: true }).notNull(),
-  status: pgEnum("event_status", ["DRAFT", "PUBLISHED", "SOLD_OUT", "CANCELLED", "COMPLETED"]).default("DRAFT").notNull(),
+  status: eventStatus("status").default("DRAFT").notNull(),
   maxTicketsPerUser: integer("maxTicketsPerUser").default(4).notNull(),
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updatedAt", { withTimezone: true })
@@ -68,7 +77,7 @@ export const seats = pgTable("seats", {
   section: varchar("section", { length: 32 }).notNull(),
   row: varchar("row", { length: 32 }).notNull(),
   number: integer("number").notNull(),
-  seatType: pgEnum("seat_type", ["VIP", "PREMIUM", "STANDARD"]).default("STANDARD").notNull(),
+  seatType: seatType("seatType").default("STANDARD").notNull(),
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => ({
   identityIdx: uniqueIndex("seats_venue_identity_idx").on(table.venueId, table.section, table.row, table.number),
@@ -92,7 +101,7 @@ export const inventory = pgTable("inventory", {
   id: serial("id").primaryKey(),
   eventId: integer("eventId").notNull().references(() => events.id, { onDelete: "cascade" }),
   seatId: integer("seatId").notNull().references(() => seats.id, { onDelete: "cascade" }),
-  status: pgEnum("inventory_status", ["AVAILABLE", "RESERVED", "SOLD", "CANCELLED"]).default("AVAILABLE").notNull(),
+  status: inventoryStatus("status").default("AVAILABLE").notNull(),
   reservationId: integer("reservationId"),
   bookingId: integer("bookingId"),
   updatedAt: timestamp("updatedAt", { withTimezone: true })
@@ -109,7 +118,7 @@ export const reservations = pgTable("reservations", {
   id: serial("id").primaryKey(),
   userId: integer("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
   eventId: integer("eventId").notNull().references(() => events.id, { onDelete: "cascade" }),
-  status: pgEnum("reservation_status", ["RESERVED", "PAYMENT_PENDING", "CONFIRMED", "EXPIRED", "PAYMENT_FAILED", "CANCELLED"]).default("RESERVED").notNull(),
+  status: reservationStatus("status").default("RESERVED").notNull(),
   expiresAt: timestamp("expiresAt", { withTimezone: true }).notNull(),
   totalAmount: decimal("totalAmount", { precision: 10, scale: 2 }).notNull(),
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
@@ -140,7 +149,7 @@ export const bookings = pgTable("bookings", {
   userId: integer("userId").notNull().references(() => users.id, { onDelete: "cascade" }),
   eventId: integer("eventId").notNull().references(() => events.id, { onDelete: "cascade" }),
   reservationId: integer("reservationId").notNull().unique().references(() => reservations.id),
-  status: pgEnum("booking_status", ["PENDING", "CONFIRMED", "CANCELLED"]).default("PENDING").notNull(),
+  status: bookingStatus("status").default("PENDING").notNull(),
   totalAmount: decimal("totalAmount", { precision: 10, scale: 2 }).notNull(),
   confirmedAt: timestamp("confirmedAt", { withTimezone: true }),
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
@@ -171,7 +180,7 @@ export const payments = pgTable("payments", {
   provider: varchar("provider", { length: 48 }).default("mock").notNull(),
   providerPaymentId: varchar("providerPaymentId", { length: 128 }).notNull().unique(),
   amount: decimal("amount", { precision: 10, scale: 2 }).notNull(),
-  status: pgEnum("payment_status", ["PENDING", "SUCCEEDED", "FAILED", "REFUNDED"]).default("PENDING").notNull(),
+  status: paymentStatus("status").default("PENDING").notNull(),
   idempotencyKey: varchar("idempotencyKey", { length: 128 }),
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updatedAt", { withTimezone: true })
@@ -190,7 +199,7 @@ export const tickets = pgTable("tickets", {
   eventId: integer("eventId").notNull().references(() => events.id, { onDelete: "cascade" }),
   inventoryId: integer("inventoryId").notNull().references(() => inventory.id),
   publicCode: varchar("publicCode", { length: 64 }).notNull().unique(),
-  status: pgEnum("ticket_status", ["VALID", "CANCELLED"]).default("VALID").notNull(),
+  status: ticketStatus("status").default("VALID").notNull(),
   createdAt: timestamp("createdAt", { withTimezone: true }).defaultNow().notNull(),
 }, (table) => ({
   bookingIdx: index("tickets_booking_idx").on(table.bookingId),
