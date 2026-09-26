@@ -8,7 +8,7 @@ Tixify is the **core booking platform**. It owns authoritative event, venue, sea
 
 - React 19 + TypeScript + Tailwind via Vite
 - Express server with tRPC procedures under `/api/trpc`
-- Drizzle ORM over MySQL/TiDB (the managed WebDev database)
+- Drizzle ORM over PostgreSQL (shared with the Person 2 security engine)
 - Server-Sent Events for live inventory updates at `/api/events/:eventId/stream`
 - Managed scheduled callback at `/api/scheduled/expire-reservations`
 
@@ -21,7 +21,7 @@ Browser UI
   -> typed tRPC procedures / SSE inventory stream
     -> router validation + auth / admin middleware
       -> booking services (transactions, state transitions, payment abstraction)
-        -> Drizzle/MySQL source of truth
+        -> Drizzle/PostgreSQL source of truth
           -> domain event bus -> connected SSE clients
 ```
 
@@ -56,7 +56,7 @@ Security middleware can run before the tRPC procedures or at the Express boundar
 ```text
 client/src/pages/       Public, checkout, wallet, and admin screens
 client/src/App.tsx      Route map
-drizzle/schema.ts       Normalized MySQL schema
+drizzle/schema.ts       Normalized PostgreSQL schema
 server/db.ts            Read helpers and database access
 server/routers.ts       Typed API contract
 server/services/        Reservation, payment, and booking transactions

@@ -14,4 +14,4 @@ Payment rows and reservations are locked during settlement. Terminal payment sta
 
 ## Test plan
 
-The required load tests should run against a real MySQL/TiDB instance, not an in-memory mock. For one event seat, start 100, 500, and 1,000 concurrent requests and assert one successful reservation and zero duplicate inventory rows. For a four-ticket user limit, run `3+3`, `4+4`, `2+2+2`, and `1+1+1+1+1` request races and assert the final confirmed plus active held count is never above four. Expiration and duplicate webhook tests should assert that inventory is released once and tickets are generated once.
+The required load tests should run against a real PostgreSQL instance, not an in-memory mock. For one event seat, start 100, 500, and 1,000 concurrent requests and assert one successful reservation and zero duplicate inventory rows. For a four-ticket user limit, run `3+3`, `4+4`, `2+2+2`, and `1+1+1+1+1` request races and assert the final confirmed plus active held count is never above four. Expiration and duplicate webhook tests should assert that inventory is released once and tickets are generated once.

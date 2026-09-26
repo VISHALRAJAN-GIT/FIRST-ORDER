@@ -58,7 +58,7 @@ Ticket QR values point to `/ticket/:publicCode`. The public verification page re
 - Express
 - tRPC 11
 - Drizzle ORM
-- MySQL/TiDB-compatible database
+- PostgreSQL database (shared with the Person 2 security engine)
 - Manus OAuth authentication
 - Vitest
 - `qrcode` for QR generation
@@ -104,7 +104,7 @@ docs/
 
 - Node.js 22 or newer
 - pnpm 10 or newer
-- MySQL/TiDB database
+- PostgreSQL database
 - Manus OAuth credentials or a configured local authentication environment
 
 ### Install dependencies
