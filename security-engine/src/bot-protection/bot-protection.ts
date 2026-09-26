@@ -36,6 +36,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { RedisLike } from '../ports/redis';
 import { SecurityError } from '../core/errors';
 import type { SecurityEventType } from './bot-signal-types';
+import { ChallengeStore, type ChallengeSubject } from './challenge';
 
 export const PROTECTION_LEVELS = [
   'NORMAL',
@@ -162,7 +163,21 @@ export interface BotProtectionOptions {
   readonly keyPrefix: string;
   readonly now: () => number;
   readonly config?: BotProtectionConfig;
-  /** Issues challenge tokens. Injected so tests need no signing setup. */
+  /**
+   * Issues a *redeemable* challenge.
+   *
+   * Prefer this over `issueChallenge`. Without it the engine can demand a
+   * challenge and nobody can pass one, which locks out every legitimate buyer
+   * who tripped a signal and pushes redemption logic into each app inconsistently.
+   */
+  readonly challenges?: ChallengeStore;
+  /**
+   * Bare token generator, for tests that do not want a Redis round trip.
+   *
+   * Produces tokens no `ChallengeStore` will accept. Setting `challenges` and
+   * `issueChallenge` together is a configuration error and the store wins, so a
+   * half-wired deployment cannot ship tokens nobody can redeem.
+   */
   readonly issueChallenge?: () => string;
   /**
    * Fired when a single signal is on its own serious enough to require a
@@ -194,6 +209,7 @@ export class BotProtection {
   readonly #now: () => number;
   readonly #config: BotProtectionConfig;
   readonly #issueChallenge: () => string;
+  readonly #challenges: ChallengeStore | undefined;
   readonly #onSignal: BotProtectionOptions['onSignal'];
 
   constructor(options: BotProtectionOptions) {
@@ -226,7 +242,7 @@ export class BotProtection {
     const scored = await this.#scoreOne(observation, subject);
     if (scored === null) return this.#decision('NORMAL', 0, [], 'signal store unavailable');
 
-    return this.#decision(this.#levelFor(scored.points), scored.points, [observation.signal], scored.reason);
+    return this.#decision(this.#levelFor(scored.points), scored.points, [observation.signal], scored.reason, this.#challengeSubjectFor(observation));
   }
 
   /**
@@ -243,6 +259,10 @@ export class BotProtection {
     const reasons: string[] = [];
     let total = 0;
     let attributed = 0;
+    // Captured from the first observation that actually scored, not observations[0]:
+    // a behavioural signal with no attributable person is skipped, and binding a
+    // challenge to the wrong subject would lock out the wrong user.
+    let challengeSubject: ChallengeSubject | undefined;
 
     for (const observation of observations) {
       const subject = this.#subjectFor(observation);
@@ -253,10 +273,11 @@ export class BotProtection {
       attributed += 1;
       if (!signals.includes(observation.signal)) signals.push(observation.signal);
       reasons.push(scored.reason);
+      challengeSubject ??= this.#challengeSubjectFor(observation);
     }
 
     if (attributed === 0) return this.#decision('NORMAL', 0, [], 'no attributable signals');
-    return this.#decision(this.#levelFor(total), total, signals, reasons.join(', '));
+    return this.#decision(this.#levelFor(total), total, signals, reasons.join(', '), challengeSubject);
   }
 
   /** Count one signal and convert it into a score contribution. */
@@ -315,6 +336,29 @@ export class BotProtection {
     return null;
   }
 
+  /**
+   * The person a challenge would be issued to.
+   *
+   * Separate from `#subjectFor` on purpose: that returns a Redis key fragment,
+   * and a challenge has to bind to the actual identifiers so a token harvested
+   * from one client cannot be presented by another. Behavioural signals with no
+   * attributable person get no challenge subject, matching the scoring rule that
+   * they are never attributed to a shared address.
+   */
+  #challengeSubjectFor(observation: BotObservation): ChallengeSubject | undefined {
+    if (BEHAVIOURAL_SIGNALS.has(observation.signal)) {
+      if (observation.userId) return { userId: observation.userId, sessionId: observation.sessionId };
+      if (observation.sessionId) return { sessionId: observation.sessionId };
+      return undefined;
+    }
+    const subject: ChallengeSubject = {
+      userId: observation.userId,
+      sessionId: observation.sessionId,
+      ip: observation.ip,
+    };
+    return subject.userId || subject.sessionId || subject.ip ? subject : undefined;
+  }
+
   async #increment(key: string, detail: string | undefined): Promise<number | null> {
     try {
       // `detail` is caller-supplied (a request hash, a seat id) and is hashed
@@ -336,12 +380,13 @@ export class BotProtection {
     return 'NORMAL';
   }
 
-  #decision(
+  async #decision(
     level: ProtectionLevel,
     score: number,
     signals: readonly BotSignal[],
     reason: string,
-  ): SecurityDecision {
+    challengeSubject?: ChallengeSubject,
+  ): Promise<SecurityDecision> {
     const now = this.#now();
     const base = { level, score, signals, reason } as const;
 
@@ -352,7 +397,21 @@ export class BotProtection {
         // Tighten, do not block. Most traffic here is legitimate users racing
         // each other for the last seats, and blocking them loses sales.
         return { ...base, allow: true, rateLimitMultiplier: 0.25 };
-      case 'CHALLENGE_REQUIRED':
+      case 'CHALLENGE_REQUIRED': {
+        // Issue a token that can actually be redeemed, bound to the subject that
+        // was flagged. Falling back to a bare random string keeps the unit tests
+        // working without Redis, but the caller then holds a token nobody can
+        // redeem, which is why `challenges` is the documented configuration.
+        if (this.#challenges && challengeSubject) {
+          const issued = await this.#challenges.issue(challengeSubject, this.#config.challengeTtlSeconds);
+          return {
+            ...base,
+            allow: false,
+            rateLimitMultiplier: 0.1,
+            challengeToken: issued.token,
+            expiresAt: issued.expiresAt,
+          };
+        }
         return {
           ...base,
           allow: false,
@@ -360,6 +419,7 @@ export class BotProtection {
           challengeToken: this.#issueChallenge(),
           expiresAt: new Date(now + this.#config.challengeTtlSeconds * 1000).toISOString(),
         };
+      }
       case 'TEMPORARILY_RESTRICTED':
         throw new SecurityError('TEMPORARILY_RESTRICTED', `Restriction applied: ${reason}`, {
           retryAfterSeconds: this.#config.restrictionTtlSeconds,
