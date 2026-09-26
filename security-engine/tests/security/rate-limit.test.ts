@@ -194,6 +194,7 @@ describe('rate limiting (Part 6)', () => {
       resetAt: '2026-01-01T00:00:00.000Z',
       dimension: 'IP',
       policy: 'CUSTOM',
+      policyId: 'CUSTOM',
     });
     expect(response.status).toBe(429);
     expect(response.body).toEqual({
@@ -246,5 +247,125 @@ describe('rate limiting (Part 6)', () => {
     const keys = await redis.keys(`${RUN_ID}:*`);
     expect(keys.length).toBeGreaterThan(0);
     expect(keys.join(' ')).not.toContain('203.0.113.250');
+  });
+
+  /**
+   * Regression: the bucket key used to be `rl:bucket:<dimension>:<identity>` with
+   * no endpoint, so every endpoint a user touched shared one allowance.
+   */
+  describe('endpoint and policy namespacing', () => {
+    const LENIENT = { requestsPerSecond: 20, burstLimit: 100, windowSeconds: 60, maxPerWindow: 600 };
+    const STRICT = { requestsPerSecond: 0.2, burstLimit: 3, windowSeconds: 60, maxPerWindow: 5 };
+
+    // Each test gets its own user so buckets cannot leak between cases; they all
+    // share one Redis instance and the key deliberately contains no test id.
+    const unique = (name: string) => subject({ userId: `U_NS_${name}`, ip: `198.51.100.${name.length}` });
+
+    it('does not let a lenient endpoint drain a strict one', async () => {
+      const user = unique('lenient_drain');
+
+      // A user polling the seat map, which is the read-heavy endpoint.
+      for (let i = 0; i < 100; i += 1) {
+        await limiter.consume({ ...user, endpoint: '/api/seats' }, LENIENT, 'USER');
+      }
+
+      // Their first payment attempt must not be rejected for read traffic.
+      const payment = await limiter.consume({ ...user, endpoint: '/api/payment' }, STRICT, 'USER');
+      expect(payment.allowed).toBe(true);
+      expect(payment.remaining).toBe(STRICT.maxPerWindow - 1);
+    });
+
+    it('does not let a strict endpoint throttle a lenient one', async () => {
+      const user = unique('strict_drain');
+      // Enough to exhaust the strict bucket three times over.
+      for (let i = 0; i < 12; i += 1) {
+        await limiter.consume({ ...user, endpoint: '/api/auth' }, STRICT, 'USER');
+      }
+      expect((await limiter.consume({ ...user, endpoint: '/api/seats' }, LENIENT, 'USER')).allowed).toBe(true);
+    });
+
+    it('keeps each endpoint at its own per-window ceiling', async () => {
+      const user = unique('per_endpoint');
+      // Burst deliberately larger than the window ceiling, so the fixed window is
+      // the binding constraint and the counter is what is being compared.
+      const windowed = { requestsPerSecond: 100, burstLimit: 50, windowSeconds: 60, maxPerWindow: 4 };
+
+      for (let i = 0; i < 4; i += 1) {
+        await limiter.consume({ ...user, endpoint: '/api/a' }, windowed, 'USER');
+        await limiter.consume({ ...user, endpoint: '/api/b' }, windowed, 'USER');
+      }
+
+      // Each endpoint has independently used its own four, so both are now at
+      // the ceiling, and each reports zero of its own remaining budget.
+      const a = await limiter.consume({ ...user, endpoint: '/api/a' }, windowed, 'USER');
+      const b = await limiter.consume({ ...user, endpoint: '/api/b' }, windowed, 'USER');
+      expect(a.allowed).toBe(false);
+      expect(b.allowed).toBe(false);
+      expect(a.remaining).toBe(0);
+      expect(b.remaining).toBe(0);
+
+      // A third endpoint is untouched by either.
+      expect((await limiter.consume({ ...user, endpoint: '/api/c' }, windowed, 'USER')).allowed).toBe(true);
+    });
+
+    it('separates two different policies on the same endpoint', async () => {
+      const user = unique('same_endpoint_two_policies');
+      const strictVariant = { ...STRICT, maxPerWindow: 2 };
+      for (let i = 0; i < 5; i += 1) await limiter.consume({ ...user, endpoint: '/api/reservations' }, STRICT, 'USER');
+      // A second, stricter variant of the same route must not inherit the
+      // exhausted budget of the first, nor cancel it out.
+      expect((await limiter.consume({ ...user, endpoint: '/api/reservations' }, strictVariant, 'USER')).allowed).toBe(true);
+    });
+
+    it('shares a bucket between call sites using identical custom policy numbers', async () => {
+      const user = unique('shared_custom');
+      // Same numbers from two different literal objects must land on one bucket,
+      // otherwise swapping a function for an inline literal silently resets the
+      // limiter's state.
+      for (let i = 0; i < 25; i += 1) {
+        await limiter.consume({ ...user, endpoint: '/api/reservations' }, { ...POLICY }, 'USER');
+      }
+      expect((await limiter.consume({ ...user, endpoint: '/api/reservations' }, { ...POLICY }, 'USER')).allowed).toBe(false);
+    });
+
+    it('reports the named policy on the verdict', async () => {
+      const verdict = await limiter.consumeFor(unique('named'), 'PAYMENT', 'IP');
+      expect(verdict.policy).toBe('PAYMENT');
+      expect(verdict.policyId).toBe('PAYMENT');
+      expect(verdict.limit).toBe(ENDPOINT_POLICIES.PAYMENT.maxPerWindow);
+    });
+
+    it('reports CUSTOM for an inline policy but keeps a stable id', async () => {
+      const user = unique('inline');
+      const verdict = await limiter.consume({ ...user, endpoint: '/api/x' }, POLICY, 'IP');
+      expect(verdict.policy).toBe('CUSTOM');
+      // The id is the scoping token: stable across equivalent policy objects so
+      // they share a bucket, and distinct for different numbers.
+      expect(verdict.policyId).toBe((await limiter.consume({ ...user, endpoint: '/api/x' }, { ...POLICY }, 'IP')).policyId);
+      expect(verdict.policyId).not.toBe((await limiter.consume({ ...user, endpoint: '/api/x' }, STRICT, 'IP')).policyId);
+    });
+
+    it('does not embed the raw endpoint in the key', async () => {
+      await limiter.consume(unique('opaque_endpoint'), POLICY, 'IP');
+      const scoped = await limiter.consume(unique('opaque_endpoint'), POLICY, 'IP');
+      expect(scoped).toBeDefined();
+      expect((await redis.keys(`${RUN_ID}:*`)).join(' ')).not.toContain('reservations');
+    });
+  });
+
+  it('names the window as the retry source when the window is what rejected', async () => {
+    // A generous bucket with a tight per-window ceiling isolates the window path.
+    const windowed = { requestsPerSecond: 100, burstLimit: 100, windowSeconds: 60, maxPerWindow: 3 };
+    const target = subject({ ip: '10.3.3.3' });
+    for (let i = 0; i < 4; i += 1) await limiter.consume(target, windowed, 'IP');
+    const rejected = await limiter.consume(target, windowed, 'IP');
+    expect(rejected.allowed).toBe(false);
+    // The bucket still has credit, so the hint must come from the window, or a
+    // client obeys Retry-After, comes back early, and is rejected again. It must
+    // also be no longer than the window itself: the key TTL is deliberately twice
+    // the window so a key cannot expire mid-window, and reporting that would make
+    // every client wait twice as long as it needs to.
+    expect(rejected.retryAfterSeconds).toBeGreaterThan(0);
+    expect(rejected.retryAfterSeconds).toBeLessThanOrEqual(60);
   });
 });

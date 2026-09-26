@@ -75,7 +75,16 @@ export interface RateLimitVerdict {
   readonly retryAfterSeconds: number;
   readonly resetAt: string;
   readonly dimension: RateLimitDimension;
+  /** Named policy that fired, or CUSTOM for an inline one. */
   readonly policy: PolicyName | 'CUSTOM';
+  /**
+   * Stable identity of the exact policy numbers, and part of the bucket key.
+   *
+   * Kept separate from `policy` because that one is a name an operator can look
+   * up, while this is an opaque scoping token. Collapsing them would make a
+   * telemetry row either unreadable or ungroupable.
+   */
+  readonly policyId: string;
 }
 
 export interface RateLimiterOptions {
@@ -171,6 +180,22 @@ function dimensionValue(subject: RateLimitSubject, dimension: RateLimitDimension
 }
 
 /**
+ * Stable identity for an inline policy.
+ *
+ * Two call sites that pass the same numbers must land on the same bucket, or a
+ * caller gets a fresh allowance every time it changes function — an unbounded
+ * way to defeat a limiter, and one that looks correct in testing because each
+ * call site is exercised in isolation. Hashing the numbers rather than using the
+ * object identity gives that for free.
+ */
+function policyFingerprint(policy: RateLimitPolicy): string {
+  return subjectKey(
+    `${policy.requestsPerSecond}:${policy.burstLimit}:${policy.windowSeconds}:${policy.maxPerWindow}`,
+    'policy',
+  );
+}
+
+/**
  * Never key on raw IP or user id.
  *
  * The stored key is a hash, so Redis never holds a readable IP address and a
@@ -211,27 +236,49 @@ export class RateLimiter {
    * Running only the bucket would let a client that pauses accumulate credit and
    * then spend it in one burst; running only the fixed window would reject a
    * legitimate short spike. Together they bound the rate and the burst.
+   *
+   * ## The key is namespaced by endpoint *and* policy
+   *
+   * This is not tidiness. The bucket key previously carried only the dimension
+   * and the subject, so every endpoint a given user touched shared one bucket.
+   * Seat availability allows 600 per minute and payment allows 5; a user polling
+   * for seats therefore spent the payment allowance on read traffic and started
+   * getting 429 at checkout, which reads as a payment bug and is not one. The
+   * fixed window was shared too, so the strict per-window ceiling was compared
+   * against a count that lenient endpoints had already inflated.
+   *
+   * `policyId` separates two different policies on the same endpoint as well,
+   * for the case where a route is deliberately limited differently by cost.
    */
   async consume(
     subject: RateLimitSubject,
     policy: RateLimitPolicy,
     dimension: RateLimitDimension,
     cost = 1,
+    options: { readonly policyId?: string; readonly policyName?: PolicyName } = {},
   ): Promise<RateLimitVerdict> {
+    const policyId = options.policyId ?? policyFingerprint(policy);
+    const reportedPolicy: PolicyName | 'CUSTOM' = options.policyName ?? 'CUSTOM';
     const identity = subjectKey(dimensionValue(subject, dimension), this.#hashSecret);
+    const scope = subjectKey(subject.endpoint, this.#hashSecret);
     const now = this.#now();
     const window = Math.floor(now / 1000 / policy.windowSeconds);
+
+    // Bound to endpoint + policy so a lenient endpoint cannot drain a strict
+    // one, and so two policies on one route cannot cancel each other out.
+    const bucketKey = `${this.#prefix}rl:bucket:${scope}:${policyId}:${dimension}:${identity}`;
+    const windowKey = `${this.#prefix}rl:window:${scope}:${policyId}:${dimension}:${identity}:${window}`;
 
     try {
       const [bucketRaw, windowRaw] = await Promise.all([
         this.#redis.eval(
           TOKEN_BUCKET_SCRIPT,
-          [`${this.#prefix}rl:bucket:${dimension}:${identity}`],
+          [bucketKey],
           [now, policy.burstLimit, policy.requestsPerSecond, cost, Math.ceil(policy.windowSeconds * 2)],
         ),
         this.#redis.eval(
           FIXED_WINDOW_SCRIPT,
-          [`${this.#prefix}rl:window:${dimension}:${identity}:${window}`],
+          [windowKey],
           [policy.windowSeconds, policy.windowSeconds * 2],
         ),
       ]);
@@ -240,13 +287,24 @@ export class RateLimiter {
       const fixed = (windowRaw as number[]).map(Number);
       const bucketAllowed = bucket[0] === 1;
       const count = fixed[0] ?? 0;
-      const windowTtl = Math.max(1, fixed[1] ?? policy.windowSeconds);
       const withinWindow = count <= policy.maxPerWindow;
       const allowed = bucketAllowed && withinWindow;
 
+      // Time until this window rolls, computed from the window index rather than
+      // read from the key's TTL. The TTL is deliberately longer than the window so
+      // a key cannot expire mid-window, which means reporting it would tell a
+      // client to wait up to twice as long as necessary, then come back still
+      // throttled.
+      const windowEndsAtMs = (window + 1) * policy.windowSeconds * 1000;
+      const secondsToWindowReset = Math.max(1, Math.ceil((windowEndsAtMs - now) / 1000));
+
+      // Retry timing has to name the limiter that actually rejected the request.
+      // Reporting the bucket's reset for a window rejection would tell a client
+      // to come back before the window rolls and be rejected again.
+      const rejectedByWindow = bucketAllowed && !withinWindow;
       const retryAfterSeconds = allowed
         ? 0
-        : Math.max(1, Math.ceil((bucket[2] ?? 0) / 1000), windowTtl);
+        : Math.max(1, rejectedByWindow ? secondsToWindowReset : Math.ceil((bucket[2] ?? 0) / 1000));
 
       return {
         allowed,
@@ -254,9 +312,10 @@ export class RateLimiter {
         limit: policy.maxPerWindow,
         remaining: Math.max(0, policy.maxPerWindow - count),
         retryAfterSeconds,
-        resetAt: new Date(bucket[3] ?? now).toISOString(),
+        resetAt: new Date(rejectedByWindow ? windowEndsAtMs : (bucket[3] ?? now)).toISOString(),
         dimension,
-        policy: 'CUSTOM',
+        policy: reportedPolicy,
+        policyId,
       };
     } catch {
       // Redis unreachable. Apply the configured posture rather than guessing.
@@ -273,19 +332,26 @@ export class RateLimiter {
         retryAfterSeconds: 0,
         resetAt: new Date(now).toISOString(),
         dimension,
-        policy: 'CUSTOM',
+        policy: reportedPolicy,
+        policyId,
       };
     }
   }
 
-  /** Named-policy convenience wrapper, so call sites cannot invent numbers. */
+  /**
+   * Named-policy convenience wrapper, so call sites cannot invent numbers.
+   *
+   * The policy name is threaded into the bucket key and reported on the verdict:
+   * telemetry that records which limit fired is the difference between "the rate
+   * limiter rejected 400 checkouts" and an answer.
+   */
   async consumeFor(
     subject: RateLimitSubject,
     policyName: PolicyName,
     dimension: RateLimitDimension,
     cost = 1,
   ): Promise<RateLimitVerdict> {
-    return this.consume(subject, ENDPOINT_POLICIES[policyName], dimension, cost);
+    return this.consume(subject, ENDPOINT_POLICIES[policyName], dimension, cost, { policyId: policyName, policyName });
   }
 }
 
