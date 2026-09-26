@@ -166,6 +166,15 @@ export type {
 
 export { DEFAULT_SEVERITIES } from './bot-protection/bot-signal-types';
 
+export { ChallengeStore } from './bot-protection/challenge';
+export type {
+  ChallengeSubject,
+  ChallengeResult,
+  ChallengeFailure,
+  IssuedChallenge,
+  ChallengeStoreOptions,
+} from './bot-protection/challenge';
+
 // --- Part 8: virtual queue --------------------------------------------------
 export {
   VirtualQueue,

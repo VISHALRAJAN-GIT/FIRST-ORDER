@@ -48,7 +48,7 @@ describe('package public surface', () => {
       // rate limiting
       'RateLimiter', 'ENDPOINT_POLICIES', 'rateLimitedResponse',
       // bot protection
-      'BotProtection', 'DEFAULT_BOT_CONFIG',
+      'BotProtection', 'DEFAULT_BOT_CONFIG', 'ChallengeStore',
       // queue
       'VirtualQueue', 'PostgresQueueStore', 'AdmissionTokenCodec',
       // validation
